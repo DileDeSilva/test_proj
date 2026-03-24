@@ -1,9 +1,30 @@
 import base64
+import os
+import traceback
+from pathlib import Path
 
 import streamlit as st
 
+# try:
+#     from dotenv import load_dotenv
+#     _env_path = Path(__file__).resolve().parent / ".env"
+#     load_dotenv(_env_path)
+# except ImportError:
+#     pass
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
 from db import Database
 from functions import QuestionnaireService, UserService
+
+# Minimal valid PDF (used only if data.pdf is missing so the chat can still run)
+_MINIMAL_PDF_B64 = (
+    "JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PC9UeXBlL0NhdGFsb2cvUGFnZXMgMiAwIFI+PgplbmRvYmoKMiAwIG9iago8PC9UeXBlL1BhZ2VzL0tpZHMgWzMgMCBSXS9Db3VudCAxPj4KZW5kb2JqCjMgMCBvYmoKPDwvVHlwZS9QYWdlL01lZGlhQm94IFswIDAgMyAzXS9QYXJlbnQgMiAwIFI+PgplbmRvYmoKeHJlZgowIDQKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTIgMDAwMDAgbiAKMDAwMDAwMDEwMSAwMDAwMCBuIAp0cmFpbGVyCjw8L1NpemUgNC9Sb290IDEgMCBSPj4Kc3RhcnR4cmVmCjE3OAolJUVPRg=="
+)
 
 
 class MentalHealthAppUI:
@@ -11,6 +32,14 @@ class MentalHealthAppUI:
         self.db = Database()
         self.user_service = UserService(db=self.db)
         self.questionnaire_service = QuestionnaireService(db=self.db)
+        # Same folder as this script — works no matter what folder you run streamlit from
+        self.chatbot_pdf_path = Path(__file__).resolve().parent / "data.pdf"
+
+    def _get_chatbot_pdf_bytes(self):
+        """Prefer data.pdf on disk; otherwise use embedded minimal PDF."""
+        if self.chatbot_pdf_path.exists():
+            return self.chatbot_pdf_path.read_bytes(), str(self.chatbot_pdf_path.name)
+        return base64.b64decode(_MINIMAL_PDF_B64), "built-in placeholder (add data.pdf next to UI.py for your content)"
 
     def add_bg_image(self):
         with open("cute-furry-cat-outdoors.jpg", "rb") as image_file:
@@ -46,6 +75,8 @@ class MentalHealthAppUI:
             st.session_state.userdetails_id = None
         if 'current_page' not in st.session_state:
             st.session_state.current_page = "main"
+        if 'chatbot_messages' not in st.session_state:
+            st.session_state.chatbot_messages = []
 
     def show_register_form(self):
         st.subheader("Registration Form")
@@ -173,25 +204,155 @@ class MentalHealthAppUI:
             self.questionnaire_service.save_questionnaire_results(None, result)
 
             st.session_state.questionnaire_result = result
+            st.session_state.chatbot_messages = []
 
             st.success("Questionnaire completed!")
-            st.write("---")
-            st.subheader("DASS-21 Evaluation Results")
-            #st.write(f"**Depression:** {result['depression_score']} - {result['depression_level']}")
-            #st.write(f"**Anxiety:** {result['anxiety_score']} - {result['anxiety_level']}")
-            #st.write(f"**Stress:** {result['stress_score']} - {result['stress_level']}")
-            st.write(f"\n**Your level is: {result['level']}**")
-
-            st.write("---")
-            st.subheader("Recommendations")
-            st.write(result['recommendations'])
 
         saved_result = st.session_state.questionnaire_result
         if saved_result:
+            st.write("---")
+            st.subheader("DASS-21 Evaluation Results")
+            st.write(f"\n**Your level is: {saved_result['level']}**")
+
+            st.write("---")
+            st.subheader("Recommendations")
+            st.write(saved_result['recommendations'])
+
+            self.show_genai_pdf_chatbot()
+
             if saved_result['level'] == "level 3":
                 self.show_level3_support()
             else:
                 self.show_exit_block()
+
+    def generate_pdf_chat_response(self, question, pdf_bytes, api_key, chat_history):
+        if genai is None or types is None:
+            raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
+
+        # Send recent conversation to keep context for multi-question chats.
+        history_lines = []
+        for message in chat_history[-10:]:
+            role = "User" if message.get("role") == "user" else "Assistant"
+            content = message.get("content", "")
+            history_lines.append(f"{role}: {content}")
+        history_text = "\n".join(history_lines)
+
+        prompt = (
+            "Answer based on the reference document provided. If the answer is not in the document, "
+            "say that clearly.\n\n"
+            f"Conversation history:\n{history_text}\n\n"
+            f"Current user question: {question}"
+        )
+
+        model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                types.Part.from_bytes(
+                    data=pdf_bytes,
+                    mime_type='application/pdf',
+                ),
+                prompt,
+            ],
+        )
+        text = self._extract_gemini_text(response)
+        return text if text else "I could not generate a response."
+
+    def _extract_gemini_text(self, response):
+        """Handle different response shapes from google-genai."""
+        if response is None:
+            return None
+        t = getattr(response, "text", None)
+        if t:
+            return t
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            parts_out = []
+            for cand in candidates:
+                content = getattr(cand, "content", None)
+                if not content:
+                    continue
+                for part in getattr(content, "parts", None) or []:
+                    ptext = getattr(part, "text", None)
+                    if ptext:
+                        parts_out.append(ptext)
+            return "\n".join(parts_out) if parts_out else None
+        except Exception:
+            return None
+
+    def _get_gemini_api_key(self):
+        """Load API key from Streamlit secrets (developer setup only)."""
+        try:
+            return str(st.secrets["GEMINI_API_KEY"]).strip()
+        except Exception:
+            pass
+        return ""
+
+    def show_genai_pdf_chatbot(self):
+        st.write("---")
+        st.subheader("Chat assistant")
+        st.caption("Ask questions below. Answers use our built-in information.")
+
+        has_genai = genai is not None and types is not None
+        api_key = self._get_gemini_api_key()
+        pdf_bytes, pdf_source = self._get_chatbot_pdf_bytes()
+
+        with st.expander("Setup status (administrator — fix if chat does not work)", expanded=not (has_genai and api_key)):
+            st.markdown(
+                f"- **google-genai package:** {'OK' if has_genai else 'MISSING — run: `pip install google-genai`'}\n"
+                f"- **GEMINI_API_KEY:** {'loaded' if api_key else 'NOT SET — create `.streamlit/secrets.toml` with `GEMINI_API_KEY=your_key`, then restart terminal'}\n"
+                f"- **PDF source:** {pdf_source}"
+            )
+
+        if not has_genai:
+            st.warning(
+                "Install the Gemini library, then refresh the page:  \n"
+                "`pip install google-genai`"
+            )
+            return
+
+        if not api_key:
+            st.warning(
+                "The API key is not loaded. Add **`.streamlit/secrets.toml`** in this project folder with:\n\n"
+                "`GEMINI_API_KEY=your_key_here`\n\n"
+                "Then **close and reopen** the terminal and run Streamlit again."
+            )
+            return
+
+        # PDF always available (file or embedded fallback)
+
+        for message in st.session_state.chatbot_messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        user_input = st.chat_input("Type your question here…")
+        if not user_input:
+            return
+
+        st.session_state.chatbot_messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        try:
+            bot_response = self.generate_pdf_chat_response(
+                user_input,
+                pdf_bytes,
+                api_key,
+                st.session_state.chatbot_messages,
+            )
+        except Exception:
+            if os.environ.get("STREAMLIT_DEBUG_CHAT", "").lower() in ("1", "true", "yes"):
+                bot_response = f"Debug error:\n```\n{traceback.format_exc()}\n```"
+            else:
+                bot_response = (
+                    "Sorry, something went wrong. Please try again in a moment."
+                )
+
+        st.session_state.chatbot_messages.append({"role": "assistant", "content": bot_response})
+        with st.chat_message("assistant"):
+            st.markdown(bot_response)
 
     def show_level3_support(self):
         st.write("---")

@@ -1,0 +1,5 @@
+# Streamlit secrets (developer API keys)
+.streamlit/secrets.toml
+
+# Local env file (API keys)
+.env
